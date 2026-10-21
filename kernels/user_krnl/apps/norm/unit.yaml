@@ -1,0 +1,31 @@
+name: norm
+moduletype: recon
+top: norm
+build: synth
+build_dir: build
+version: 0.1.0
+part: xcu280-fsvh2892-2L-e
+arch: ultraplus
+
+rtl:
+  dir: "src/rtl"
+  files:
+    - norm.v
+    - norm_core.v
+    - ../../../../reassembly/rtl/slot_credit.v
+    - ../../../../reassembly/rtl/axis_fifo_taxi.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_if.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_fifo.sv
+
+xdc:
+  dir: "src/xdc"
+  files:
+
+xci:
+  dir: "src/xci"
+  files:
+
+ip:
+  dir: "src/ip"
+  files:
+    - gen_ip.tcl

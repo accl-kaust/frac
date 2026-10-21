@@ -1,0 +1,978 @@
+#!/usr/bin/env python
+
+import os
+from collections import deque
+from dataclasses import dataclass
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.result import SimTimeoutError
+from cocotb.triggers import RisingEdge, with_timeout
+
+from cocotbext.axi import AxiBus, AxiRam, AxiStreamBus, AxiStreamFrame, AxiStreamSink, AxiStreamSource
+
+
+BYTE_LANES = 64
+MAX_PACKET_BYTES = 8192     # pkt_receiver.v MAX_PACKET_BYTES: longest TCP segment accepted
+# The host never sends a segment longer than the MSS the TOE advertises.  Builds
+# up to 4585 advertised hls/toe's default of 1460, which is not a multiple of
+# BYTE_LANES; the Makefile now builds the TOE with TCP_STACK_MSS = 8192 (jumbo
+# frames), or 1408 for a network with a 1500-byte MTU.
+LEGACY_TOE_MSS = 1460
+TOE_MSS = 8192
+TOE_MSS_1500_MTU = 1408
+# A request may span several segments; the scheduler holds a multi-segment
+# request in a 512-beat queue FIFO until its declared size has arrived, and
+# pkt_sender holds the whole response in a 512-beat FIFO before announcing it.
+MAX_REQUEST_BYTES = 512 * BYTE_LANES
+RECONF_APP = 0x00AB
+OP_WRITE_HBM = 1
+OP_READ_HBM = 2
+REQ_FLAG_FIRST = 0x1
+REQ_FLAG_LAST = 0x2
+REQ_FLAG_SINGLE = REQ_FLAG_FIRST | REQ_FLAG_LAST
+
+
+def int_to_le_bytes(value, byte_count):
+    return int(value).to_bytes(byte_count, "little")
+
+
+def frame_to_int(frame):
+    return int.from_bytes(bytes(frame.tdata), "little")
+
+
+def assert_keep_all(frame, byte_count):
+    assert frame.tkeep is None or frame.tkeep == [1] * byte_count
+
+
+def pack_reconf_command(opcode, addr, size, slot_id=0):
+    payload = bytearray(BYTE_LANES)
+    payload[0] = opcode
+    payload[1] = slot_id
+    payload[8:16] = int(addr).to_bytes(8, "little")
+    payload[16:24] = int(size).to_bytes(8, "little")
+    return bytes(payload)
+
+
+def response_metadata(conn_id, byte_count):
+    """
+    The TCP tx metadata pkt_sender hands the stack, {length, session}, read
+    from the response beat that carries tlast.  The scheduler gives the slot
+    {request size, session} as meta (the header's packet_size, not the length
+    of one TCP packet), so the echo forwards it unchanged and the response is
+    reported as long as the whole request, however many TCP packets it came in.
+    """
+    return TcpNotification(length=byte_count, conn_id=conn_id).pack()
+
+
+def reconf_response_metadata(conn_id):
+    return response_metadata(conn_id, BYTE_LANES)
+
+
+@dataclass
+class TcpNotification:
+    length: int
+    conn_id: int
+    closed: bool = False
+
+    def pack(self) -> int:
+        return ((self.length & 0xffff) << 16) | (self.conn_id & 0xffff)
+
+    def to_bytes(self) -> bytes:
+        return int_to_le_bytes(self.pack() | (int(self.closed) << 80), 11)
+
+
+@dataclass
+class RequestHeader:
+    total_size: int
+    workload_id: int
+    top_config: int = 0xffff
+    request_flags: int = REQ_FLAG_SINGLE
+
+    def to_bytes(self) -> bytes:
+        config = (self.top_config & ~0x3) | (self.request_flags & 0x3)
+        return (
+            bytes([0xff] * 56)
+            + self.total_size.to_bytes(4, "little")
+            + config.to_bytes(2, "little")
+            + self.workload_id.to_bytes(2, "little")
+        )
+
+
+@dataclass
+class SinglePacketRequest:
+    length: int = BYTE_LANES
+    conn_id: int = 1
+    workload_id: int = 0
+
+    @property
+    def notification(self) -> TcpNotification:
+        return TcpNotification(length=self.length, conn_id=self.conn_id)
+
+    @property
+    def header(self) -> RequestHeader:
+        return RequestHeader(total_size=self.length, workload_id=self.workload_id, request_flags=REQ_FLAG_SINGLE)
+
+    @property
+    def metadata(self) -> int:
+        return self.notification.pack()
+
+    @property
+    def payload(self) -> bytes:
+        return self.header.to_bytes()
+
+
+@dataclass
+class MultiPacketRequest:
+    packet_lengths: tuple
+    conn_id: int = 1
+    workload_id: int = 0
+
+    @property
+    def total_size(self) -> int:
+        return sum(self.packet_lengths)
+
+    @property
+    def notifications(self):
+        return [TcpNotification(length=length, conn_id=self.conn_id) for length in self.packet_lengths]
+
+    @property
+    def payloads(self):
+        header = RequestHeader(total_size=self.total_size, workload_id=self.workload_id, request_flags=REQ_FLAG_FIRST).to_bytes()
+        return [header] + [bytes([idx] * length) for idx, length in enumerate(self.packet_lengths[1:], start=1)]
+
+
+class TB:
+    def __init__(self, dut):
+        self.dut = dut
+
+        cocotb.start_soon(Clock(dut.clk, 4, units="ns").start())
+
+        self.notifications_source = AxiStreamSource(
+            AxiStreamBus.from_prefix(dut, "s_axis_notifications"), dut.clk, dut.rst
+        )
+        self.rx_data_source = AxiStreamSource(
+            AxiStreamBus.from_prefix(dut, "s_axis_rx_data"), dut.clk, dut.rst
+        )
+        self.tx_status_source = AxiStreamSource(
+            AxiStreamBus.from_prefix(dut, "s_axis_tx_status"), dut.clk, dut.rst
+        )
+
+        self.read_package_sink = AxiStreamSink(
+            AxiStreamBus.from_prefix(dut, "m_axis_read_package"), dut.clk, dut.rst
+        )
+        self.tx_metadata_sink = AxiStreamSink(
+            AxiStreamBus.from_prefix(dut, "m_axis_tx_metadata"), dut.clk, dut.rst
+        )
+        self.tx_data_sink = AxiStreamSink(
+            AxiStreamBus.from_prefix(dut, "m_axis_tx_data"), dut.clk, dut.rst
+        )
+        self.axi_ram = AxiRam(AxiBus.from_prefix(dut, "m_axi"), dut.clk, dut.rst, size=2**20)
+
+    def init_static_inputs(self):
+        dut = self.dut
+
+        dut.rst.setimmediatevalue(1)
+        dut.m_axis_open_connection_tready.setimmediatevalue(1)
+        dut.s_axis_open_status_tvalid.setimmediatevalue(0)
+        dut.s_axis_open_status_tdata.setimmediatevalue(0)
+        dut.m_axis_close_connection_tready.setimmediatevalue(1)
+        dut.m_axis_listen_port_tready.setimmediatevalue(1)
+        dut.s_axis_listen_port_status_tvalid.setimmediatevalue(0)
+        dut.s_axis_listen_port_status_tdata.setimmediatevalue(0)
+        dut.s_axis_rx_metadata_tvalid.setimmediatevalue(0)
+        dut.s_axis_rx_metadata_tdata.setimmediatevalue(0)
+        dut.m_axi_rdata_parity.setimmediatevalue(0)
+
+    async def reset(self):
+        self.init_static_inputs()
+        await RisingEdge(self.dut.clk)
+        await RisingEdge(self.dut.clk)
+        self.dut.rst.value = 0
+        for _ in range(4):
+            await RisingEdge(self.dut.clk)
+
+    async def send_notification(self, notification: TcpNotification) -> int:
+        await with_timeout(self.notifications_source.send(AxiStreamFrame(notification.to_bytes())), 2, "us")
+        read_cmd = await with_timeout(self.read_package_sink.recv(), 2, "us")
+        return frame_to_int(read_cmd)
+
+    async def expect_notification_unread(self, notification: TcpNotification):
+        await self.notifications_source.send(AxiStreamFrame(notification.to_bytes()))
+        try:
+            await with_timeout(self.read_package_sink.recv(), 200, "ns")
+        except SimTimeoutError:
+            return
+        raise AssertionError("a notification without data produced a read command")
+
+    async def send_rx_payload(self, payload: bytes):
+        await with_timeout(self.rx_data_source.send(AxiStreamFrame(payload)), 2, "us")
+
+    async def send_tx_status_ok(self):
+        await with_timeout(self.tx_status_source.send(AxiStreamFrame(int_to_le_bytes(0, 8))), 2, "us")
+
+    async def recv_response(self):
+        metadata_frame = await self.tx_metadata_sink.recv()
+        data_frame = await self.tx_data_sink.recv()
+        return metadata_frame, data_frame
+
+    async def expect_no_response(self, timeout=500, units="ns"):
+        try:
+            metadata_frame = await with_timeout(self.tx_metadata_sink.recv(), timeout, units)
+        except SimTimeoutError:
+            return
+        raise AssertionError(f"unexpected extra response metadata 0x{frame_to_int(metadata_frame):08x}")
+
+
+class ToeRxBuffer:
+    """
+    The TOE's RX path as built, with RX_DDR_BYPASS: every segment the TOE
+    accepts is queued in one FIFO shared by all sessions (rx_buffer_fifo in
+    tcp_stack.sv), and each read_package releases the segment at the head of
+    that FIFO, whatever session and length the read names.  The TB's other
+    helpers hand over a segment only once its own read has been seen, which
+    hides what an unanswered notification does on the board.
+
+    Owns read_package_sink; do not mix with TB.send_notification.
+    """
+
+    def __init__(self, tb):
+        self.tb = tb
+        self.queued = deque()
+        self.reads = []
+        cocotb.start_soon(self._serve_reads())
+
+    async def receive_segment(self, segment: bytes, conn_id: int):
+        self.queued.append(segment)
+        notification = TcpNotification(length=len(segment), conn_id=conn_id)
+        await with_timeout(self.tb.notifications_source.send(AxiStreamFrame(notification.to_bytes())), 2, "us")
+
+    async def _serve_reads(self):
+        while True:
+            read_cmd = await self.tb.read_package_sink.recv()
+            self.reads.append(frame_to_int(read_cmd))
+            await self.tb.rx_data_source.send(AxiStreamFrame(self.queued.popleft()))
+
+
+def echo_response(payloads) -> bytes:
+    """C00 (apps/pattern_slot): every request beat is echoed, payload and meta
+    unchanged; the meta names the request size, which is the response size."""
+    return b"".join(payloads)
+
+
+def or_response(payloads) -> bytes:
+    """C01 (apps/or_slot): every request beat comes back with its payload OR-ed
+    with all ones, meta unchanged."""
+    return bytes([0xff]) * sum(len(payload) for payload in payloads)
+
+
+async def run_single_packet_request(dut, workload_id, expected):
+    tb = TB(dut)
+    await tb.reset()
+
+    request = SinglePacketRequest(conn_id=0x1234, workload_id=workload_id)
+    expected_payload = expected([request.payload])
+
+    read_cmd = await tb.send_notification(request.notification)
+    assert read_cmd == request.metadata
+
+    await tb.send_rx_payload(request.payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await tb.recv_response()
+
+    assert bytes(data_frame.tdata) == expected_payload
+    assert_keep_all(data_frame, BYTE_LANES)
+    assert frame_to_int(metadata_frame) == response_metadata(request.conn_id, len(expected_payload))
+
+
+async def run_multi_packet_request(dut, workload_id, expected):
+    tb = TB(dut)
+    await tb.reset()
+
+    request = MultiPacketRequest(packet_lengths=(BYTE_LANES, BYTE_LANES), conn_id=0x2345, workload_id=workload_id)
+    expected_payload = expected(request.payloads)
+
+    for notification, payload in zip(request.notifications, request.payloads):
+        read_cmd = await tb.send_notification(notification)
+        assert read_cmd == notification.pack()
+        await tb.send_rx_payload(payload)
+
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    # two TCP packets of 64 bytes: the meta names the 128-byte request, not the last packet
+    assert frame_to_int(metadata_frame) == response_metadata(request.conn_id, len(expected_payload))
+    assert bytes(data_frame.tdata) == expected_payload
+    assert_keep_all(data_frame, len(expected_payload))
+
+
+async def run_single_tcp_packet_multi_beat_app_request(dut, workload_id, expected):
+    tb = TB(dut)
+    await tb.reset()
+
+    total_size = 2 * BYTE_LANES
+    notification = TcpNotification(length=total_size, conn_id=0x2456)
+    payload = RequestHeader(total_size=total_size, workload_id=workload_id).to_bytes() + bytes([0x5a] * BYTE_LANES)
+    expected_payload = expected([payload])
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == response_metadata(notification.conn_id, len(expected_payload))
+    assert bytes(data_frame.tdata) == expected_payload
+    assert_keep_all(data_frame, len(expected_payload))
+
+
+@cocotb.test()
+async def test_header_flags_replace_ff_prefix_for_single_packet(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    header = bytearray(RequestHeader(total_size=BYTE_LANES, workload_id=0x0000).to_bytes())
+    header[0:56] = bytes((idx + 1) & 0xFF for idx in range(56))
+    notification = TcpNotification(length=BYTE_LANES, conn_id=0x2468)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(bytes(header))
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == response_metadata(notification.conn_id, BYTE_LANES)
+    assert bytes(data_frame.tdata) == echo_response([bytes(header)])
+    assert_keep_all(data_frame, BYTE_LANES)
+
+
+@cocotb.test()
+async def test_multi_packet_payload_ff_and_flag_bits_are_not_header(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    conn_id = 0x2470
+    first = RequestHeader(total_size=2 * BYTE_LANES, workload_id=0x0000, request_flags=REQ_FLAG_FIRST).to_bytes()
+    continuation = bytes([0xff] * BYTE_LANES)
+    notifications = [
+        TcpNotification(length=BYTE_LANES, conn_id=conn_id),
+        TcpNotification(length=BYTE_LANES, conn_id=conn_id),
+    ]
+
+    for notification, payload in zip(notifications, [first, continuation]):
+        read_cmd = await tb.send_notification(notification)
+        assert read_cmd == notification.pack()
+        await tb.send_rx_payload(payload)
+
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == response_metadata(conn_id, 2 * BYTE_LANES)
+    assert bytes(data_frame.tdata) == echo_response([first, continuation])
+    assert_keep_all(data_frame, 2 * BYTE_LANES)
+    await tb.expect_no_response()
+
+
+async def run_repeated_multi_packet_requests(dut, workload_id, line_count, request_count, expected):
+    tb = TB(dut)
+    await tb.reset()
+
+    for request_idx in range(request_count):
+        request = MultiPacketRequest(
+            packet_lengths=tuple([BYTE_LANES] * line_count),
+            conn_id=0x5000 + request_idx,
+            workload_id=workload_id,
+        )
+
+        for notification, payload in zip(request.notifications, request.payloads):
+            read_cmd = await tb.send_notification(notification)
+            assert read_cmd == notification.pack()
+            await tb.send_rx_payload(payload)
+
+        await tb.send_tx_status_ok()
+
+        metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+        expected_payload = expected(request.payloads)
+        assert frame_to_int(metadata_frame) == response_metadata(request.conn_id, len(expected_payload))
+        assert bytes(data_frame.tdata) == expected_payload
+        assert_keep_all(data_frame, len(expected_payload))
+
+
+async def run_back_to_back_three_line_requests(dut, workload_id, expected):
+    tb = TB(dut)
+    await tb.reset()
+
+    requests = [
+        MultiPacketRequest(packet_lengths=(BYTE_LANES, BYTE_LANES, BYTE_LANES), conn_id=0x5000, workload_id=workload_id),
+        MultiPacketRequest(packet_lengths=(BYTE_LANES, BYTE_LANES, BYTE_LANES), conn_id=0x5000, workload_id=workload_id),
+    ]
+
+    for request in requests:
+        for notification, payload in zip(request.notifications, request.payloads):
+            read_cmd = await tb.send_notification(notification)
+            assert read_cmd == notification.pack()
+            await tb.send_rx_payload(payload)
+
+    await tb.send_tx_status_ok()
+    await tb.send_tx_status_ok()
+
+    for request in requests:
+        metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+        expected_payload = expected(request.payloads)
+        assert frame_to_int(metadata_frame) == response_metadata(request.conn_id, len(expected_payload))
+        assert bytes(data_frame.tdata) == expected_payload
+        assert_keep_all(data_frame, len(expected_payload))
+
+
+def segment_request(request, segment_bytes, header_alone):
+    """
+    Split a request into TCP segments of segment_bytes (64-byte multiples, at
+    most MAX_PACKET_BYTES, which pkt_receiver.v enforces).  header_alone is
+    what sw/app sends: the header line as its own segment, then segment_bytes
+    of data per segment.  Otherwise the request is cut into segment_bytes
+    segments with the header inside the first one.
+    """
+    if header_alone:
+        segments = [request[:BYTE_LANES]]
+        data = request[BYTE_LANES:]
+        segments += [data[o:o + segment_bytes] for o in range(0, len(data), segment_bytes)]
+    else:
+        segments = [request[o:o + segment_bytes] for o in range(0, len(request), segment_bytes)]
+    for segment in segments:
+        assert BYTE_LANES <= len(segment) <= MAX_PACKET_BYTES and len(segment) % BYTE_LANES == 0
+    return segments
+
+
+def build_echo_request(total_bytes, conn_id):
+    """A multi-line echo request: header line, then data lines numbered from 1."""
+    header = RequestHeader(total_size=total_bytes, workload_id=0x0000, request_flags=REQ_FLAG_FIRST).to_bytes()
+    data = b"".join(bytes([(idx + 1) & 0xff]) * BYTE_LANES for idx in range(total_bytes // BYTE_LANES - 1))
+    return header + data
+
+
+async def send_segments(tb, segments, conn_id):
+    for segment in segments:
+        notification = TcpNotification(length=len(segment), conn_id=conn_id)
+        read_cmd = await tb.send_notification(notification)
+        assert read_cmd == notification.pack()
+        await tb.send_rx_payload(segment)
+
+
+async def run_segmented_echo_request(tb, total_bytes, segment_bytes, header_alone, conn_id):
+    """
+    The echo returns every beat, so the response is the whole request and the
+    response metadata names its declared size -- not the size of the TCP
+    segment the last beat arrived in.  Every FIFO on the path has to hold the
+    request: the scheduler releases a multi-segment request only once its
+    declared size has arrived, and pkt_sender emits the tx metadata only once
+    the response's last beat is in its payload FIFO.
+    """
+    request = build_echo_request(total_bytes, conn_id)
+    segments = segment_request(request, segment_bytes, header_alone)
+    await send_segments(tb, segments, conn_id)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 400, "us")
+
+    assert frame_to_int(metadata_frame) == response_metadata(conn_id, total_bytes), (
+        f"{total_bytes}B in {len(segments)} segments of {segment_bytes}B: meta {frame_to_int(metadata_frame):#010x}")
+    assert bytes(data_frame.tdata) == request, (
+        f"{total_bytes}B in {len(segments)} segments of {segment_bytes}B: {len(data_frame.tdata)}B back")
+    assert_keep_all(data_frame, total_bytes)
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_echo_request_in_one_max_segment(dut):
+    """A 4096-byte request in a single 4096-byte segment, the longest pkt_receiver accepts."""
+    tb = TB(dut)
+    await tb.reset()
+    await run_segmented_echo_request(tb, MAX_PACKET_BYTES, MAX_PACKET_BYTES, header_alone=False, conn_id=0x6100)
+    await run_segmented_echo_request(tb, MAX_PACKET_BYTES, MAX_PACKET_BYTES, header_alone=True, conn_id=0x6101)
+
+
+@cocotb.test()
+async def test_echo_request_larger_than_a_segment(dut):
+    """
+    Requests declared larger than one segment, delivered in 4096-byte
+    segments and reassembled by the scheduler: 8192, 16384 and the 32768
+    bytes that fill a 512-beat queue FIFO exactly.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    for total_bytes in [2 * MAX_PACKET_BYTES, 4 * MAX_PACKET_BYTES, MAX_REQUEST_BYTES]:
+        await run_segmented_echo_request(tb, total_bytes, MAX_PACKET_BYTES, header_alone=False, conn_id=0x6110)
+        await run_segmented_echo_request(tb, total_bytes, MAX_PACKET_BYTES, header_alone=True, conn_id=0x6111)
+
+
+@cocotb.test()
+async def test_echo_request_4096_in_1024B_segments(dut):
+    """4096 bytes as 4 x 1024, and as a header segment plus 1024/1024/1024/960."""
+    tb = TB(dut)
+    await tb.reset()
+    await run_segmented_echo_request(tb, 4096, 1024, header_alone=False, conn_id=0x6120)
+    await run_segmented_echo_request(tb, 4096, 1024, header_alone=True, conn_id=0x6121)
+
+
+@cocotb.test()
+async def test_echo_request_sizes_in_512B_segments(dut):
+    """Requests of every shape between two lines and 4096 bytes in 512-byte segments (sw/app's framing), back to back on one connection."""
+    tb = TB(dut)
+    await tb.reset()
+    for total_bytes in [128, 512, 576, 1024, 2048, 4032, 4096]:
+        await run_segmented_echo_request(tb, total_bytes, 512, header_alone=True, conn_id=0x6200)
+        await run_segmented_echo_request(tb, total_bytes, 512, header_alone=False, conn_id=0x6201)
+
+
+@cocotb.test()
+async def test_echo_requests_cut_at_toe_mss(dut):
+    """
+    Requests over 1408 bytes as the host sends them to a TOE advertising
+    TOE_MSS, and to one built with TOE_MSS_1500_MTU: every write cut into
+    MSS-byte segments plus a remainder, all whole lines.  Both shapes: the
+    request written in one piece, and sw/app's header segment followed by the
+    data in one write.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    for mss in [TOE_MSS, TOE_MSS_1500_MTU]:
+        for total_bytes in [1472, 1536, 2880, 4096]:
+            await run_segmented_echo_request(tb, total_bytes, mss, header_alone=False, conn_id=0x6210)
+            await run_segmented_echo_request(tb, total_bytes, mss, header_alone=True, conn_id=0x6211)
+
+
+@cocotb.test()
+async def test_two_connections_interleaved_max_requests(dut):
+    """
+    Two connections, both 4096 bytes, their 512-byte segments arriving
+    alternately, back to back at the scheduler input.  A queue is written
+    only in the cycle a beat of its own connection is accepted, so neither
+    response picks up the other's beats or repeats its own.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    conns = [0x6400, 0x6401]
+    requests = {conn_id: build_echo_request(4096, conn_id) for conn_id in conns}
+    segments = {conn_id: segment_request(requests[conn_id], 512, header_alone=True) for conn_id in conns}
+    for idx in range(len(segments[conns[0]])):
+        for conn_id in conns:
+            await send_segments(tb, [segments[conn_id][idx]], conn_id)
+    for _ in conns:
+        await tb.send_tx_status_ok()
+
+    for _ in conns:
+        metadata_frame, data_frame = await with_timeout(tb.recv_response(), 400, "us")
+        meta = frame_to_int(metadata_frame)
+        conn_id = meta & 0xffff
+        assert meta == response_metadata(conn_id, 4096)
+        assert bytes(data_frame.tdata) == requests[conn_id], (
+            f"conn {conn_id:#x}: {len(data_frame.tdata)} bytes back for a 4096-byte request")
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_single_packet_echo_app(dut):
+    await run_single_packet_request(dut, workload_id=0x0000, expected=echo_response)
+
+
+@cocotb.test()
+async def test_single_packet_or_app(dut):
+    await run_single_packet_request(dut, workload_id=0x0001, expected=or_response)
+
+
+@cocotb.test()
+async def test_multi_packet_echo_app(dut):
+    await run_multi_packet_request(dut, workload_id=0x0000, expected=echo_response)
+
+
+@cocotb.test()
+async def test_single_tcp_packet_multi_beat_echo_app(dut):
+    await run_single_tcp_packet_multi_beat_app_request(dut, workload_id=0x0000, expected=echo_response)
+
+
+@cocotb.test()
+async def test_repeated_three_line_echo_app(dut):
+    await run_repeated_multi_packet_requests(dut, workload_id=0x0000, line_count=3, request_count=8, expected=echo_response)
+
+
+@cocotb.test()
+async def test_back_to_back_three_line_echo_app(dut):
+    await run_back_to_back_three_line_requests(dut, workload_id=0x0000, expected=echo_response)
+
+
+@cocotb.test()
+async def test_repeated_six_line_echo_app(dut):
+    await run_repeated_multi_packet_requests(dut, workload_id=0x0000, line_count=6, request_count=8, expected=echo_response)
+
+
+@cocotb.test()
+async def test_reconf_read_hbm_request(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x4000
+    expected_payload = bytes((0x40 + idx) & 0xFF for idx in range(BYTE_LANES))
+    tb.axi_ram.write(addr, expected_payload)
+
+    request_payload = (
+        RequestHeader(total_size=2 * BYTE_LANES, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_READ_HBM, addr, BYTE_LANES)
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x3456)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await tb.recv_response()
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == expected_payload
+    assert_keep_all(data_frame, BYTE_LANES)
+
+
+@cocotb.test()
+async def test_reconf_write_hbm_uses_command_size(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x5000
+    write_size = 96
+    payload_capacity = 2 * BYTE_LANES
+    payload = bytes((0x80 + idx) & 0xFF for idx in range(payload_capacity))
+    original = bytes([0xee] * payload_capacity)
+    tb.axi_ram.write(addr, original)
+
+    request_payload = (
+        RequestHeader(total_size=BYTE_LANES + BYTE_LANES + payload_capacity, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_WRITE_HBM, addr, write_size)
+        + payload
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x4567)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == bytes(BYTE_LANES)
+    assert_keep_all(data_frame, BYTE_LANES)
+    assert bytes(tb.axi_ram.read(addr, payload_capacity)) == payload[:write_size] + original[write_size:]
+
+
+@cocotb.test()
+async def test_reconf_write_hbm_exact_board_packet_has_one_response(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x4000
+    payload = bytes((0x40 + idx) & 0xFF for idx in range(BYTE_LANES))
+    original = bytes([0xee] * BYTE_LANES)
+    tb.axi_ram.write(addr, original)
+
+    request_payload = (
+        RequestHeader(total_size=2 * BYTE_LANES, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_WRITE_HBM, addr, BYTE_LANES)
+        + payload
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x6c00)
+
+    assert len(request_payload) == 3 * BYTE_LANES
+    assert request_payload[56:60] == bytes([0x80, 0x00, 0x00, 0x00])
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == bytes(BYTE_LANES)
+    assert_keep_all(data_frame, BYTE_LANES)
+    assert bytes(tb.axi_ram.read(addr, BYTE_LANES)) == payload
+
+    await tb.expect_no_response()
+
+    await tb.send_tx_status_ok()
+    await tb.expect_no_response()
+
+    await tb.send_tx_status_ok()
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_reconf_write_hbm_payload_ff_prefix_is_not_header(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x4800
+    payload = bytes([0xff] * 56) + bytes((0x80 + idx) & 0xFF for idx in range(8))
+    original = bytes([0xee] * BYTE_LANES)
+    tb.axi_ram.write(addr, original)
+
+    request_payload = (
+        RequestHeader(total_size=2 * BYTE_LANES, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_WRITE_HBM, addr, BYTE_LANES)
+        + payload
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x6d00)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == bytes(BYTE_LANES)
+    assert_keep_all(data_frame, BYTE_LANES)
+    assert bytes(tb.axi_ram.read(addr, BYTE_LANES)) == payload
+
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_reconf_repeated_exact_write_hbm_has_one_response_each(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    for req_idx in range(3):
+        addr = 0x4000 + req_idx * BYTE_LANES
+        payload = bytes((0x40 + req_idx + idx) & 0xFF for idx in range(BYTE_LANES))
+        request_payload = (
+            RequestHeader(total_size=2 * BYTE_LANES, workload_id=RECONF_APP).to_bytes()
+            + pack_reconf_command(OP_WRITE_HBM, addr, BYTE_LANES)
+            + payload
+        )
+        notification = TcpNotification(length=len(request_payload), conn_id=0x6c00 + req_idx)
+
+        read_cmd = await tb.send_notification(notification)
+        assert read_cmd == notification.pack()
+
+        await tb.send_rx_payload(request_payload)
+        await tb.send_tx_status_ok()
+
+        metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+        assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+        assert bytes(data_frame.tdata) == bytes(BYTE_LANES)
+        assert_keep_all(data_frame, BYTE_LANES)
+        assert bytes(tb.axi_ram.read(addr, BYTE_LANES)) == payload
+
+        await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_reconf_write_hbm_ignores_transport_padding(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x6000
+    write_size = BYTE_LANES
+    payload_capacity = 2 * BYTE_LANES
+    payload = bytes((0x20 + idx) & 0xFF for idx in range(payload_capacity))
+    original = bytes([0xee] * payload_capacity)
+    tb.axi_ram.write(addr, original)
+
+    request_payload = (
+        RequestHeader(total_size=BYTE_LANES + payload_capacity, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_WRITE_HBM, addr, write_size)
+        + payload
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x5678)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == bytes(BYTE_LANES)
+    assert_keep_all(data_frame, BYTE_LANES)
+    assert bytes(tb.axi_ram.read(addr, payload_capacity)) == payload[:write_size] + original[write_size:]
+
+    await tb.expect_no_response()
+    await tb.send_tx_status_ok()
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_reconf_read_hbm_ignores_extra_packet_data(dut):
+    tb = TB(dut)
+    await tb.reset()
+
+    addr = 0x7000
+    expected_payload = bytes((0x60 + idx) & 0xFF for idx in range(BYTE_LANES))
+    tb.axi_ram.write(addr, expected_payload)
+    extra_payload = bytes((0xa0 + idx) & 0xFF for idx in range(BYTE_LANES))
+
+    request_payload = (
+        RequestHeader(total_size=3 * BYTE_LANES, workload_id=RECONF_APP).to_bytes()
+        + pack_reconf_command(OP_READ_HBM, addr, BYTE_LANES)
+        + extra_payload
+    )
+    notification = TcpNotification(length=len(request_payload), conn_id=0x6789)
+
+    read_cmd = await tb.send_notification(notification)
+    assert read_cmd == notification.pack()
+
+    await tb.send_rx_payload(request_payload)
+    await tb.send_tx_status_ok()
+
+    metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+
+    assert frame_to_int(metadata_frame) == reconf_response_metadata(notification.conn_id)
+    assert bytes(data_frame.tdata) == expected_payload
+    assert_keep_all(data_frame, BYTE_LANES)
+
+    await tb.expect_no_response()
+    await tb.send_tx_status_ok()
+    await tb.expect_no_response()
+
+
+@cocotb.test()
+async def test_refused_segments_are_read_and_discarded(dut):
+    """
+    Segments that are not whole lines, or longer than MAX_PACKET_BYTES, are
+    still read -- the TOE only releases a segment when it is read -- and none
+    of their data reaches a slot, even data shaped like a request header.
+    """
+    tb = TB(dut)
+    await tb.reset()
+
+    conn_id = 0x4567
+    for length in [LEGACY_TOE_MSS, 1472 - LEGACY_TOE_MSS, 100, MAX_PACKET_BYTES + BYTE_LANES]:
+        notification = TcpNotification(length=length, conn_id=conn_id)
+        read_cmd = await tb.send_notification(notification)
+        assert read_cmd == notification.pack(), f"{length}-byte segment: read {read_cmd:#010x}"
+        header = RequestHeader(total_size=BYTE_LANES, workload_id=0x0000).to_bytes()
+        await tb.send_rx_payload((header * (length // BYTE_LANES + 1))[:length])
+    await tb.expect_no_response()
+
+    await run_segmented_echo_request(tb, 2 * BYTE_LANES, 2 * BYTE_LANES, header_alone=False, conn_id=conn_id)
+
+
+@cocotb.test()
+async def test_close_notification_is_not_read(dut):
+    """A close carries no data, so there is no segment to release: no read."""
+    tb = TB(dut)
+    await tb.reset()
+
+    await tb.expect_notification_unread(TcpNotification(length=0, conn_id=0x4568, closed=True))
+    await run_segmented_echo_request(tb, 2 * BYTE_LANES, 2 * BYTE_LANES, header_alone=False, conn_id=0x4569)
+
+
+@cocotb.test()
+async def test_request_cut_at_legacy_mss_leaves_later_requests_intact(dut):
+    """
+    What the board saw from a TOE advertising MSS 1460: a 1472-byte request
+    written in one piece reaches it as segments of 1460 and 12 bytes, both
+    refused.  Before refused segments were read, both stayed in the TOE's RX
+    FIFO, the next request was answered with the 1460-byte segment, and every
+    later read on every connection was two segments behind.  Now the cut
+    request gets no response and leaves nothing behind.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    toe = ToeRxBuffer(tb)
+
+    cut = build_echo_request(1472, 0x7100)
+    for offset in range(0, len(cut), LEGACY_TOE_MSS):
+        await toe.receive_segment(cut[offset:offset + LEGACY_TOE_MSS], conn_id=0x7100)
+    await tb.expect_no_response(timeout=2, units="us")
+
+    for idx, total_bytes in enumerate([BYTE_LANES, 2 * BYTE_LANES, TOE_MSS]):
+        conn_id = 0x7101 + idx
+        request = build_echo_request(total_bytes, conn_id)
+        await toe.receive_segment(request, conn_id=conn_id)
+        await tb.send_tx_status_ok()
+
+        metadata_frame, data_frame = await with_timeout(tb.recv_response(), 20, "us")
+        assert frame_to_int(metadata_frame) == response_metadata(conn_id, total_bytes)
+        assert bytes(data_frame.tdata) == request, f"{total_bytes}B request: {len(data_frame.tdata)}B back"
+        assert_keep_all(data_frame, total_bytes)
+    await tb.expect_no_response()
+
+    assert toe.reads == [
+        TcpNotification(length=1460, conn_id=0x7100).pack(),
+        TcpNotification(length=12, conn_id=0x7100).pack(),
+        TcpNotification(length=BYTE_LANES, conn_id=0x7101).pack(),
+        TcpNotification(length=2 * BYTE_LANES, conn_id=0x7102).pack(),
+        TcpNotification(length=TOE_MSS, conn_id=0x7103).pack(),
+    ]
+    assert not toe.queued
+
+
+tests_dir = os.path.dirname(__file__)
+rtl_dir = os.path.abspath(os.path.join(tests_dir, "..", "rtl"))
+reconf_rtl_dir = os.path.abspath(os.path.join(tests_dir, "..", "..", "reconfctrl", "rtl"))
+apps_dir = os.path.abspath(os.path.join(tests_dir, "..", "..", "apps"))
+taxi_rtl_dir = os.path.abspath(os.path.join(tests_dir, "..", "..", "..", "..", "lib", "taxi", "axis", "rtl"))
+taxi_prim_rtl_dir = os.path.abspath(os.path.join(tests_dir, "..", "..", "..", "..", "lib", "taxi", "prim", "rtl"))
+
+
+def test_reassembly(request):
+    import cocotb_test.simulator
+
+    verilog_sources = [
+        os.path.join(taxi_rtl_dir, "taxi_axis_if.sv"),
+        os.path.join(taxi_rtl_dir, "taxi_axis_fifo.sv"),
+        os.path.join(taxi_prim_rtl_dir, "taxi_penc.sv"),
+        os.path.join(taxi_prim_rtl_dir, "taxi_arbiter.sv"),
+        os.path.join(taxi_rtl_dir, "taxi_axis_register.sv"),
+        os.path.join(taxi_rtl_dir, "taxi_axis_switch.sv"),
+        os.path.join(rtl_dir, "axis_fifo_taxi.sv"),
+        os.path.join(rtl_dir, "axis_data_fifo_replacements.sv"),
+        os.path.join(rtl_dir, "axis_register.v"),
+        os.path.join(rtl_dir, "axis_pipeline_register.v"),
+        os.path.join(rtl_dir, "slot_credit.v"),
+        os.path.join(rtl_dir, "slot_boundary.v"),
+        os.path.join(rtl_dir, "dispatcher.v"),
+        os.path.join(rtl_dir, "scheduler.v"),
+        os.path.join(rtl_dir, "slot_tx_axis_switch.sv"),
+        os.path.join(reconf_rtl_dir, "axis_dfx_decoupler.sv"),
+        os.path.join(apps_dir, "pattern_slot", "src", "rtl", "pattern_slot.v"),
+        os.path.join(apps_dir, "pattern_slot", "src", "rtl", "pattern_slot_core.v"),
+        os.path.join(apps_dir, "or_slot", "src", "rtl", "or_slot.v"),
+        os.path.join(apps_dir, "or_slot", "src", "rtl", "or_slot_core.v"),
+        os.path.join(tests_dir, "cell_bbx_pattern_sim.sv"),
+        os.path.join(reconf_rtl_dir, "reconfctrl.v"),
+        os.path.join(reconf_rtl_dir, "icap_ctrl.v"),
+        os.path.join(rtl_dir, "pkt_logic.v"),
+        os.path.join(rtl_dir, "pkt_receiver.v"),
+        os.path.join(rtl_dir, "pkt_sender.v"),
+        os.path.join(rtl_dir, "tcp_top_loopback.v"),
+    ]
+
+    sim_build = os.path.join(tests_dir, "sim_build", request.node.name.replace("[", "-").replace("]", ""))
+
+    cocotb_test.simulator.run(
+        simulator="verilator",
+        verilog_sources=verilog_sources,
+        toplevel="tcp_top_loopback",
+        module="test_reassembly",
+        sim_build=sim_build,
+        extra_args=["--sv", "-DSIMULATION", "-Wno-PINMISSING", "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC"],
+    )

@@ -1,0 +1,96 @@
+name: frac
+version: 0.1.0
+part: xcu280-fsvh2892-2L-e
+arch: ultraplus
+moduletype: static
+top: frac_top
+build: bitgen
+build_dir: build
+dcp_path: null
+
+ip_repo_paths:
+  - build/lib
+
+rtl:
+  dir: .
+  files:
+  - frac/rtl/frac_top.v
+  - frac/rtl/frac.v
+  - frac/rtl/frac_hbm.v
+  - lib/axis/rtl/axis_fifo.v
+  - lib/axis/rtl/sync_reset.v
+  - lib/axis/rtl/reset_gen.v
+  - lib/axis/rtl/axis_fifo_ultra.v
+  - lib/axis/rtl/axis_reg.v
+  - lib/taxi/prim/rtl/taxi_penc.sv
+  - lib/taxi/prim/rtl/taxi_arbiter.sv
+  - lib/taxi/axis/rtl/taxi_axis_if.sv
+  - lib/taxi/axis/rtl/taxi_axis_fifo.sv
+  - lib/taxi/axis/rtl/taxi_axis_register.sv
+  - lib/taxi/axis/rtl/taxi_axis_switch.sv
+  - kernels/common/types/network_intf.svh
+  - kernels/common/types/network_types.svh
+  - kernels/common/types/network_types.svh.in
+  - kernels/cmac_krnl/rtl/cmac_krnl.sv
+  - kernels/cmac_krnl/rtl/cmac_krnl_control_s_axi.sv
+  - kernels/cmac_krnl/rtl/cmac_usplus_axis_wrapper.sv
+  - kernels/cmac_krnl/rtl/network_module.sv
+  - kernels/cmac_krnl/rtl/network_clk_cross.sv
+  - kernels/cmac_krnl/rtl/axis_data_reg_array.sv
+  - kernels/cmac_krnl/rtl/axis_data_reg.sv
+  - kernels/network_krnl/rtl/tcp_stack.sv
+  - kernels/network_krnl/rtl/udp_stack.sv
+  - kernels/network_krnl/rtl/network_top.sv
+  - kernels/network_krnl/rtl/network_krnl.sv
+  - kernels/network_krnl/rtl/network_stack.sv
+  - kernels/network_krnl/rtl/network_control_s_axi.sv
+  - kernels/network_krnl/rtl/axis_data_reg.sv
+  - kernels/network_krnl/rtl/axis_meta_reg.sv
+  - kernels/network_krnl/rtl/axis_udp_meta_reg.sv
+  - kernels/network_krnl/rtl/axis_data_reg_array.sv
+  - kernels/network_krnl/rtl/mem_single_inf.sv
+  - kernels/user_krnl/reassembly/rtl/user_krnl.v
+  - kernels/user_krnl/reassembly/rtl/axis_fifo_taxi.sv
+  - kernels/user_krnl/reassembly/rtl/axis_data_fifo_replacements.sv
+  - kernels/user_krnl/reassembly/rtl/axis_register.v
+  - kernels/user_krnl/reassembly/rtl/axis_pipeline_register.v
+  - kernels/user_krnl/reassembly/rtl/slot_credit.v
+  - kernels/user_krnl/reassembly/rtl/slot_boundary.v
+  - kernels/user_krnl/reassembly/rtl/dispatcher.v
+  - kernels/user_krnl/reassembly/rtl/ipcore_top_top_k.v
+  - kernels/user_krnl/reassembly/rtl/slot_tx_axis_switch.sv
+  - kernels/user_krnl/reassembly/rtl/pkt_logic.v
+  - kernels/user_krnl/reassembly/rtl/pkt_receiver.v
+  - kernels/user_krnl/reassembly/rtl/pkt_sender.v
+  - kernels/user_krnl/reassembly/rtl/scheduler.v
+  - kernels/user_krnl/reassembly/rtl/tcp_top_loopback.v
+  - kernels/user_krnl/reassembly/rtl/user_krnl_control_s_axi.v
+  - kernels/user_krnl/reconfctrl/rtl/axis_dfx_decoupler.sv
+  - kernels/user_krnl/reconfctrl/rtl/cell_bbx.sv
+  - kernels/user_krnl/reconfctrl/rtl/reconfctrl.v
+  - kernels/user_krnl/reconfctrl/rtl/icap_ctrl.v
+
+xdc:
+  dir: .
+  files:
+  - frac/xdc/fpga_u280.xdc
+  - lib/axis/xdc/sync_reset.tcl
+  - frac/xdc/floorplan.xdc
+
+xci:
+  dir: .
+  files: null
+
+ip:
+  dir: .
+  files:
+  - kernels/network_krnl/ip/network_stack.tcl
+  - kernels/network_krnl/ip/network_infrastructure.tcl
+  - kernels/network_krnl/ip/network_ultrascale.tcl
+  - frac/ip/proc_sys_reset.tcl
+  - frac/ip/axis_data_width_conv.tcl
+  - kernels/cmac_krnl/ip/cmac.tcl
+  - frac/ip/hbm_0.tcl
+  - frac/ip/axi_prot_conv.tcl
+  - frac/ip/axi_data_width_conv.tcl
+  - frac/ip/axi_clock_conv.tcl

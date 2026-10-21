@@ -1,0 +1,14 @@
+.DS_Store
+.idea
+*.log
+tmp/
+.*
+!.github
+build
+*.swp
+sim_build/
+results.xml
+__pycache__/
+dump.fst
+dump.vcd
+accl

@@ -1,0 +1,779 @@
+#!/usr/bin/env python
+"""
+cocotb testbench for top_k.
+
+Protocol under test (see ../src/rtl/top_k.v):
+
+  optional header beat : tdata[447:0] all ones marks the beat as a header,
+                         tdata[495:480] carries the result mask.  Not data.
+  data beats           : 16 x 32-bit unsigned values, little-endian word order.
+  tlast                : final beat of the request.
+  response             : one beat, 16 x 32-bit values in descending order,
+                         word 0 largest, word i zeroed when mask bit i is
+                         clear, words >= TOP_K_NUM always zero.
+  slot boundary        : tdata = {meta[31:0], tlast, payload[511:0]}, 545 bits.
+                         Request meta is {request size, session}; the response
+                         beat carries {64, session}, which pkt_sender hands the
+                         TCP stack as the tx metadata.
+
+The core takes a line every cycle: each line is sorted whole by a bitonic
+network and merged whole into one of four running top-16 lists, which are
+merged into one after the request's last line.
+
+TWO LEVELS.  LEVEL=core (the default) drives top_k_core itself: every
+handshake, the sideband, the timing.  LEVEL=slot drives the module as it is
+built into a cell, behind the static side of its slot (reassembly/tb/tb_slot.sv):
+credits and PIPE_LEN register stages each way, which carry no sideband.
+
+Run:
+
+  make                     # verilator, the core, TOP_K_NUM=16
+  make LEVEL=slot          # the module behind its slot's static side
+  make TOP_K_NUM=8         # override the parameter (LEVEL=core)
+  make WAVES=1             # dump dump.fst alongside this file
+  make SIM=icarus
+  pytest -n auto           # sweep TOP_K_NUM over several builds
+"""
+
+import itertools
+import logging
+import os
+import random
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.regression import TestFactory
+from cocotb.triggers import RisingEdge, with_timeout
+
+from cocotbext.axi import AxiStreamBus, AxiStreamFrame, AxiStreamSink, AxiStreamSource
+
+
+VALUE_W = 32
+VALUE_BYTES = VALUE_W // 8
+BYTE_LANES = 64                             # 512-bit stream
+WORDS_PER_LINE = BYTE_LANES // VALUE_BYTES  # 16
+VALUE_MAX = 2**VALUE_W - 1
+MASK_ALL = 0xffff
+
+# A line is taken every cycle.
+LINE_CYCLES = 1
+
+# From the last data line taken to the response: the sort (5 registers), two
+# cycles to start merging the four lists, and the merge itself, 12.  A request
+# of fewer than four lines leaves lists empty, which the merge skips.
+SORT_STAGES = 5
+RESPONSE_CYCLES = SORT_STAGES + 2 + 12
+RESPONSE_CYCLES_FOR_LINES = {1: 10, 2: 14}
+
+CLK_PERIOD_NS = 4
+
+# Generous bound so a deadlocked DUT fails the run instead of hanging it; the
+# pause generators can stretch a request several times over.  The core took
+# 17 cycles a line before it streamed; that still bounds it.
+RESPONSE_TIMEOUT_NS = 64 * (WORDS_PER_LINE + 1) * CLK_PERIOD_NS
+
+LEVEL = os.environ.get("LEVEL", "core")
+
+# static's response sink: its FIFO, CREDITS deep, and its output register
+SLOT_RESPONSE_LINES = 64 + 1
+
+
+# ------------------------------------------------------ slot boundary beats
+#
+# The slot's tdata is the upstream offrac workload interface flattened onto one
+# AXI-Stream (see ../src/rtl/top_k.v): {meta[31:0], tlast, payload[511:0]},
+# 545 bits, one beat per 64-byte line.  cocotbext-axi sees a one-lane bus of
+# 545-bit "bytes", so a frame's tdata is a list of ints, one per beat.
+
+PAYLOAD_W = 512
+META_W = 32
+TLAST_BIT = PAYLOAD_W
+META_SHIFT = PAYLOAD_W + 1
+PAYLOAD_MASK = (1 << PAYLOAD_W) - 1
+
+SESSION = 0x1234        # default session id; varied where it matters
+
+
+def slot_meta(length, session):
+    """meta = {length[15:0], session[15:0]}."""
+    return ((length & 0xffff) << 16) | (session & 0xffff)
+
+
+def pack_beats(payload, session=SESSION, req_bytes=None):
+    """
+    Split a byte payload into slot beats, in-band tlast on the last one.  The
+    request meta is {request size, session}: the scheduler puts the header's
+    packet_size -- the size of the whole request, header line included -- in
+    the length field of every beat (scheduler.v rx_req_size), so that is what
+    the slot derives its response meta from.
+    """
+    lines = [payload[i:i+BYTE_LANES] for i in range(0, len(payload), BYTE_LANES)]
+    if req_bytes is None:
+        req_bytes = len(payload)
+    return [(slot_meta(req_bytes, session) << META_SHIFT)
+            | (int(i == len(lines) - 1) << TLAST_BIT)
+            | int.from_bytes(line, "little")
+            for i, line in enumerate(lines)]
+
+
+def beat_payload(beat):
+    return (beat & PAYLOAD_MASK).to_bytes(BYTE_LANES, "little")
+
+
+def beat_tlast(beat):
+    return (beat >> TLAST_BIT) & 1
+
+
+def beat_meta(beat):
+    return (beat >> META_SHIFT) & ((1 << META_W) - 1)
+
+
+def frame_payload(frame):
+    return b"".join(beat_payload(beat) for beat in frame.tdata)
+
+
+def check_response_meta(frame, response_bytes, session=SESSION):
+    """
+    In-band tlast only on the final beat, and that beat's meta is
+    {response bytes, session}: pkt_sender hands it to the TCP stack as the tx
+    metadata, so a wrong length there truncates or stalls the reply on the
+    board.  Nothing reads the meta of earlier beats, so they are not checked.
+    """
+    lasts = [beat_tlast(beat) for beat in frame.tdata]
+    assert lasts == [0] * (len(lasts) - 1) + [1], f"in-band tlast per beat: {lasts}"
+    got = beat_meta(frame.tdata[-1])
+    want = slot_meta(response_bytes, session)
+    assert got == want, (
+        f"response meta {got:#010x}, want {want:#010x} (length {got >> 16} vs "
+        f"{response_bytes}, session {got & 0xffff:#06x} vs {session:#06x})")
+
+
+# ------------------------------------------------------------------ packing
+
+def pack_line(values):
+    """One 64-byte beat holding up to 16 little-endian 32-bit values."""
+    assert len(values) <= WORDS_PER_LINE
+    padded = list(values) + [0] * (WORDS_PER_LINE - len(values))
+    return b"".join(int(v).to_bytes(VALUE_BYTES, "little") for v in padded)
+
+
+def unpack_line(data):
+    data = bytes(data)
+    assert len(data) == BYTE_LANES
+    return [int.from_bytes(data[i:i+VALUE_BYTES], "little")
+            for i in range(0, BYTE_LANES, VALUE_BYTES)]
+
+
+def header_line(mask=MASK_ALL, size=0, workload_id=0):
+    """
+    A fRAC request header: 0xff over bytes 0..55 (tdata[447:0]), the request
+    size in bytes 56..59, the config word -- which the slot reads as the
+    result mask, tdata[495:480] -- in bytes 60..61, the workload id in bytes
+    62..63.  Only the mask reaches the sorter; the other fields are filled in
+    here to show that the slot ignores them.
+    """
+    return (bytes([0xff] * 56)
+            + int(size).to_bytes(4, "little")
+            + int(mask).to_bytes(2, "little")
+            + int(workload_id).to_bytes(2, "little"))
+
+
+def build_request(values, mask=None):
+    """
+    Build a request payload and return it with the value list the slot will
+    actually sort.  `values` is split across as many 16-word lines as needed
+    and the last line is zero-padded -- that padding is data, so it comes back
+    in the returned list.  `values=None` builds a header-only request.
+    """
+    lines = []
+    if values is not None:
+        lines = [list(values[i:i+WORDS_PER_LINE])
+                 for i in range(0, len(values), WORDS_PER_LINE)] or [[]]
+
+    payload = b""
+    if mask is not None:
+        payload += header_line(mask, size=(len(lines) + 1) * BYTE_LANES)
+
+    sent = []
+    for line in lines:
+        payload += pack_line(line)
+        sent += line + [0] * (WORDS_PER_LINE - len(line))
+
+    return payload, sent
+
+
+def reference_response(sent, mask, top_k_num):
+    """What the response beat should hold for the values the slot was given."""
+    ranked = sorted(sent, reverse=True)[:top_k_num]
+    ranked += [0] * (top_k_num - len(ranked))
+    return ([v if (mask >> i) & 1 else 0 for i, v in enumerate(ranked)]
+            + [0] * (WORDS_PER_LINE - top_k_num))
+
+
+def sideband(value):
+    """cocotbext-axi collapses a sideband signal to a scalar when uniform."""
+    if isinstance(value, (list, tuple)):
+        assert len(set(value)) == 1, f"sideband varies across the frame: {value}"
+        return value[0]
+    return value
+
+
+def dut_top_k_num(dut):
+    try:
+        return int(dut.TOP_K_NUM.value)
+    except AttributeError:
+        return int(os.environ.get("PARAM_TOP_K_NUM", WORDS_PER_LINE))
+
+
+# ----------------------------------------------------------------- harness
+
+class TB:
+    def __init__(self, dut):
+        self.dut = dut
+
+        self.log = logging.getLogger("cocotb.tb")
+        self.log.setLevel(logging.DEBUG)
+
+        cocotb.start_soon(Clock(dut.clk, 4, units="ns").start())
+
+        self.source = AxiStreamSource(AxiStreamBus.from_prefix(dut, "s_axis"), dut.clk, dut.rst)
+        self.sink = AxiStreamSink(AxiStreamBus.from_prefix(dut, "m_axis"), dut.clk, dut.rst)
+
+        # tstrb is not part of AxiStreamBus and the slot ignores it -- drive it
+        # anyway so the input side is never X.
+        dut.s_axis_tstrb.setimmediatevalue(1)   # KEEP_W = 1: one 545-bit lane
+        if LEVEL == "slot":
+            dut.decouple.setimmediatevalue(0)
+
+        self.top_k_num = dut_top_k_num(dut)
+        self.log.info("TOP_K_NUM = %d", self.top_k_num)
+
+    def set_idle_generator(self, generator=None):
+        if generator:
+            self.source.set_pause_generator(generator())
+
+    def set_backpressure_generator(self, generator=None):
+        if generator:
+            self.sink.set_pause_generator(generator())
+
+    async def reset(self):
+        self.dut.rst.setimmediatevalue(0)
+        await wait_cycles(self.dut, 2)
+        self.dut.rst.value = 1
+        await wait_cycles(self.dut, 2)
+        self.dut.rst.value = 0
+        await wait_cycles(self.dut, 2)
+
+    async def send_request(self, values, mask=None, session=SESSION, **frame_kwargs):
+        payload, sent = build_request(values, mask)
+        await self.source.send(AxiStreamFrame(pack_beats(payload, session), **frame_kwargs))
+        return sent
+
+    async def recv_response(self, session=SESSION):
+        frame = await with_timeout(self.sink.recv(), RESPONSE_TIMEOUT_NS, "ns")
+        assert len(frame.tdata) == 1, "the response must be a single beat"
+        check_response_meta(frame, BYTE_LANES, session)
+        return frame
+
+    def check(self, frame, sent, mask=MASK_ALL):
+        got = unpack_line(frame_payload(frame))
+        want = reference_response(sent, mask, self.top_k_num)
+        assert got == want, f"\n got  {got}\n want {want}"
+
+    async def run_request(self, values, mask=None, session=SESSION, **frame_kwargs):
+        sent = await self.send_request(values, mask, session, **frame_kwargs)
+        frame = await self.recv_response(session)
+        self.check(frame, sent, MASK_ALL if mask is None else mask)
+        return frame
+
+
+def core(dut):
+    """top_k_core: the top level at LEVEL=core, inside the module at LEVEL=slot.
+    The checks about the core's own handshake -- when it accepts, when it
+    answers, when it refuses -- read its ports; everything else goes through
+    the top level."""
+    return dut if LEVEL == "core" else dut.rm_inst.core_inst
+
+
+async def wait_cycles(dut, count):
+    for _ in range(count):
+        await RisingEdge(dut.clk)
+
+
+def cycle_pause():
+    return itertools.cycle([1, 1, 1, 0])
+
+
+def random_values(count, spread=VALUE_MAX):
+    return [random.randrange(spread + 1) for _ in range(count)]
+
+
+# ------------------------------------------------------------------- tests
+
+async def run_test_single_line(dut, idle_inserter=None, backpressure_inserter=None):
+    """One header plus one data line, against a reference sort."""
+    tb = TB(dut)
+    await tb.reset()
+
+    tb.set_idle_generator(idle_inserter)
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    await tb.run_request(random_values(WORDS_PER_LINE), mask=MASK_ALL)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_multi_line(dut, line_count=2, idle_inserter=None, backpressure_inserter=None):
+    """A request spread over several data lines -- more values than K."""
+    tb = TB(dut)
+    await tb.reset()
+
+    tb.set_idle_generator(idle_inserter)
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    await tb.run_request(random_values(line_count * WORDS_PER_LINE), mask=MASK_ALL)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_no_header(dut):
+    """Without a header line the mask defaults to all-ones and no beat is eaten."""
+    tb = TB(dut)
+    await tb.reset()
+
+    values = random_values(2 * WORDS_PER_LINE)
+    frame = await tb.run_request(values, mask=None)
+
+    assert unpack_line(frame_payload(frame))[0] == max(values)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_header_only(dut):
+    """A header carrying tlast is a complete request: an all-zero response."""
+    tb = TB(dut)
+    await tb.reset()
+
+    frame = await tb.run_request(None, mask=MASK_ALL)
+    assert unpack_line(frame_payload(frame)) == [0] * WORDS_PER_LINE
+
+    # ...and the slot is left ready for a real request.
+    await tb.run_request(random_values(WORDS_PER_LINE), mask=MASK_ALL)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_mask(dut, mask=MASK_ALL):
+    """The mask gates result words; a thermometer mask returns the low K."""
+    tb = TB(dut)
+    await tb.reset()
+
+    values = [(i + 1) * 100 for i in range(WORDS_PER_LINE)]
+    random.shuffle(values)
+    frame = await tb.run_request(values, mask=mask)
+
+    words = unpack_line(frame_payload(frame))
+    for i in range(WORDS_PER_LINE):
+        if i >= tb.top_k_num or not (mask >> i) & 1:
+            assert words[i] == 0, f"word {i} not gated off by mask {mask:#06x}"
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_unsigned_compare(dut):
+    """Values straddling 2**31 must rank as unsigned."""
+    tb = TB(dut)
+    await tb.reset()
+
+    values = [0x7fffffff, 0xffffffff, 0x00000001, 0x80000000,
+              0x00000000, 0xfffffffe, 0x80000001, 0x7ffffffe]
+    values += [0] * (WORDS_PER_LINE - len(values))
+    frame = await tb.run_request(values, mask=MASK_ALL)
+
+    assert unpack_line(frame_payload(frame))[0] == 0xffffffff
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_duplicates_and_zeros(dut):
+    """Ties must occupy their own slots and payload zeros must not be dropped."""
+    tb = TB(dut)
+    await tb.reset()
+
+    def expect(ranked):
+        return (ranked + [0] * WORDS_PER_LINE)[:tb.top_k_num]
+
+    # every value identical except one outlier: the ties fill the rest of the
+    # array rather than collapsing into one slot
+    values = [7] * WORDS_PER_LINE
+    values[5] = 42
+    frame = await tb.run_request(values, mask=MASK_ALL)
+    assert unpack_line(frame_payload(frame))[:tb.top_k_num] == expect([42] + [7] * (WORDS_PER_LINE - 1))
+
+    # a line that is mostly zeros: the zeros are values, not padding to drop
+    values = [0] * WORDS_PER_LINE
+    values[0], values[1] = 9, 4
+    frame = await tb.run_request(values, mask=MASK_ALL)
+    assert unpack_line(frame_payload(frame))[:tb.top_k_num] == expect([9, 4])
+
+    # two full lines of the same value, so every slot ties
+    frame = await tb.run_request([123] * (2 * WORDS_PER_LINE), mask=MASK_ALL)
+    assert unpack_line(frame_payload(frame))[:tb.top_k_num] == expect([123] * WORDS_PER_LINE)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_back_to_back(dut, backpressure_inserter=None):
+    """State must not leak between requests: the array clears, the mask resets."""
+    tb = TB(dut)
+    await tb.reset()
+
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    big = [0xf0000000 + i for i in range(WORDS_PER_LINE)]
+    small = [i + 1 for i in range(WORDS_PER_LINE)]
+
+    # a masked request, then an unmasked one that must see neither the old
+    # mask nor the old (much larger) values
+    sent_a = await tb.send_request(big, mask=0x0003)
+    sent_b = await tb.send_request(small, mask=None)
+
+    frame_a = await tb.recv_response()
+    frame_b = await tb.recv_response()
+
+    tb.check(frame_a, sent_a, 0x0003)
+    tb.check(frame_b, sent_b, MASK_ALL)
+    assert max(unpack_line(frame_payload(frame_b))) == max(small)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_sideband(dut):
+    """tid/tdest/tuser come from the first beat of the request."""
+    tb = TB(dut)
+    await tb.reset()
+
+    id_count = 2**len(tb.source.bus.tid)
+    dest_count = 2**len(tb.source.bus.tdest)
+
+    for tid, tdest, tuser in [(1, 1, 0), (id_count - 1, dest_count - 1, 1), (0, 0, 0)]:
+        payload, sent = build_request(random_values(2 * WORDS_PER_LINE), mask=MASK_ALL)
+        beats = pack_beats(payload)
+
+        # hold the intended sideband on the first beat only -- every later
+        # beat carries something else, which the slot must ignore
+        other = ((tid + 1) % id_count, (tdest + 1) % dest_count, tuser ^ 1)
+        await tb.source.send(AxiStreamFrame(
+            beats,
+            tid=[tid] + [other[0]] * (len(beats) - 1),
+            tdest=[tdest] + [other[1]] * (len(beats) - 1),
+            tuser=[tuser] + [other[2]] * (len(beats) - 1),
+        ))
+
+        frame = await tb.recv_response()
+        tb.check(frame, sent, MASK_ALL)
+
+        assert sideband(frame.tid) == tid
+        assert sideband(frame.tdest) == tdest
+        assert sideband(frame.tuser) == tuser
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_response_meta(dut):
+    """
+    The response beat's meta is {64, session}: the session from the request's
+    meta, the length a constant -- the response is one beat whatever the
+    request size in the meta says.
+    """
+    tb = TB(dut)
+    await tb.reset()
+
+    for session in [0x0000, 0x0001, 0xabcd, 0xffff]:
+        for lines in [1, 2, 5]:
+            sent = await tb.send_request(random_values(lines * WORDS_PER_LINE), MASK_ALL, session)
+            frame = await tb.recv_response(session)
+            tb.check(frame, sent, MASK_ALL)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_response_held(dut):
+    """
+    A response is held stable until it is accepted, and the core takes one
+    request at a time: with the sink stalled its response waits in the core
+    and nothing more is taken.  At LEVEL=slot static's response sink holds
+    SLOT_RESPONSE_LINES responses first.  Released, every response comes back
+    in order and intact.
+    """
+    tb = TB(dut)
+
+    # cocotbext-axi's sink samples `pause` at the top of its driver loop and
+    # the setter wakes a parked driver before it stores the new value, so a
+    # sink parked on an idle bus can miss the change and leave tready high.
+    # Pausing before reset is released means the driver starts out paused.
+    tb.sink.pause = True
+    await tb.reset()
+
+    capacity = 1 + (SLOT_RESPONSE_LINES if LEVEL == "slot" else 0)
+    hs = core(dut)
+
+    # one data line per request, no header, so every beat taken is a request
+    requests = [await tb.send_request(random_values(WORDS_PER_LINE), mask=None)
+                for _ in range(capacity + 3)]
+
+    taken = 0
+
+    async def count_taken():
+        nonlocal taken
+        while True:
+            await RisingEdge(dut.clk)
+            if int(hs.s_axis_tvalid.value) and int(hs.s_axis_tready.value):
+                taken += 1
+
+    counter = cocotb.start_soon(count_taken())
+    await wait_cycles(dut, (capacity + 3) * 4 * RESPONSE_CYCLES + 200)
+
+    assert taken == capacity, f"took {taken} requests with room to answer {capacity}"
+
+    held = int(dut.m_axis_tdata.value)
+    core_held = int(hs.m_axis_tdata.value)
+    for _ in range(32):
+        await RisingEdge(dut.clk)
+        assert int(dut.m_axis_tvalid.value) == 1, "tvalid dropped before tready"
+        assert int(dut.m_axis_tdata.value) == held, "tdata moved before tready"
+        assert int(hs.m_axis_tvalid.value) == 1, "the core dropped its waiting response"
+        assert int(hs.m_axis_tdata.value) == core_held, "the core's waiting response moved"
+        assert int(hs.s_axis_tready.value) == 0, "input accepted with a response pending"
+    counter.kill()
+
+    tb.sink.pause = False
+
+    for sent in requests:
+        frame = await tb.recv_response()
+        tb.check(frame, sent, MASK_ALL)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_test_timing(dut, lines=2):
+    """
+    A line a cycle, a header included, and the response RESPONSE_CYCLES after
+    the last line however long the request -- sooner for one or two lines,
+    whose empty lists the final merge skips.
+    """
+    tb = TB(dut)
+    await tb.reset()
+
+    accepts = []
+    resp_cycle = None
+    cycle = 0
+
+    hs = core(dut)
+
+    async def watch():
+        nonlocal resp_cycle, cycle
+        while True:
+            await RisingEdge(dut.clk)
+            cycle += 1
+            if int(hs.s_axis_tvalid.value) and int(hs.s_axis_tready.value):
+                accepts.append(cycle)
+            if resp_cycle is None and int(hs.m_axis_tvalid.value):
+                resp_cycle = cycle
+
+    watcher = cocotb.start_soon(watch())
+
+    sent = await tb.send_request(random_values(lines * WORDS_PER_LINE), mask=MASK_ALL)
+    frame = await tb.recv_response()
+    watcher.kill()
+
+    tb.check(frame, sent, MASK_ALL)
+
+    assert len(accepts) == lines + 1, f"expected header + {lines} data beats, got {accepts}"
+    gaps = [b - a for a, b in zip(accepts, accepts[1:])]
+    assert gaps == [LINE_CYCLES] * lines, f"line spacing {gaps}"
+    want = RESPONSE_CYCLES_FOR_LINES.get(lines, RESPONSE_CYCLES)
+    assert resp_cycle - accepts[-1] == want, (
+        f"response {resp_cycle - accepts[-1]} cycles after the last line, want {want}")
+
+    await wait_cycles(dut, 2)
+
+
+async def run_test_reset_mid_request(dut):
+    """A reset part way through a request leaves no residue behind."""
+    tb = TB(dut)
+    await tb.reset()
+
+    # mid request, as the last lines are sorted, while the lists merge, and
+    # with the response waiting
+    for stall in [2, 4, 9, 14, 20, 40]:
+        tb.sink.pause = stall == 40
+        await tb.send_request([VALUE_MAX] * (8 * WORDS_PER_LINE), mask=0x0001)
+        await tb.source.wait()
+        await wait_cycles(dut, stall)
+
+        await tb.reset()
+        # reset drops the frame in flight but leaves the driver queues alone
+        tb.source.clear()
+        tb.sink.clear()
+        tb.sink.pause = False
+
+        assert int(dut.m_axis_tvalid.value) == 0
+        assert tb.sink.empty()
+
+        values = random_values(WORDS_PER_LINE, spread=0xffff)
+        frame = await tb.run_request(values, mask=None)
+        assert unpack_line(frame_payload(frame))[0] == max(values)
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+async def run_stress_test(dut, idle_inserter=None, backpressure_inserter=None):
+    """Randomised requests, masks and sideband, checked against the model."""
+    tb = TB(dut)
+    await tb.reset()
+
+    tb.set_idle_generator(idle_inserter)
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    id_count = 2**len(tb.source.bus.tid) if LEVEL == "core" else 1
+    dest_count = 2**len(tb.source.bus.tdest) if LEVEL == "core" else 1
+
+    pending = []
+
+    for _ in range(64):
+        lines = random.randint(1, 4)
+        # a narrow spread every so often, to force ties in the sorted array
+        spread = random.choice([VALUE_MAX, VALUE_MAX, 0xff, 7])
+        values = random_values(lines * WORDS_PER_LINE, spread)
+        mask = random.choice([None, MASK_ALL, random.randrange(0x10000)])
+        tid = random.randrange(id_count)
+        tdest = random.randrange(dest_count)
+        session = random.randrange(0x10000)
+
+        sent = await tb.send_request(values, mask, session, tid=tid, tdest=tdest)
+        pending.append((sent, MASK_ALL if mask is None else mask, tid, tdest, session))
+
+    for sent, mask, tid, tdest, session in pending:
+        frame = await tb.recv_response(session)
+        tb.check(frame, sent, mask)
+        if LEVEL == "core":
+            assert sideband(frame.tid) == tid
+            assert sideband(frame.tdest) == tdest
+
+    assert tb.sink.empty()
+    await wait_cycles(dut, 2)
+
+
+if getattr(cocotb, 'top', None) is not None:
+
+    factory = TestFactory(run_test_single_line)
+    factory.add_option("idle_inserter", [None, cycle_pause])
+    factory.add_option("backpressure_inserter", [None, cycle_pause])
+    factory.generate_tests()
+
+    factory = TestFactory(run_test_multi_line)
+    factory.add_option("line_count", [1, 2, 5])
+    factory.add_option("idle_inserter", [None, cycle_pause])
+    factory.add_option("backpressure_inserter", [None, cycle_pause])
+    factory.generate_tests()
+
+    factory = TestFactory(run_test_mask)
+    factory.add_option("mask", [0x0000, 0x0001, 0x0003, 0x0005, 0x00ff, 0xff00, 0xaaaa, 0xffff])
+    factory.generate_tests()
+
+    factory = TestFactory(run_test_back_to_back)
+    factory.add_option("backpressure_inserter", [None, cycle_pause])
+    factory.generate_tests()
+
+    for test in [
+                run_test_no_header,
+                run_test_header_only,
+                run_test_unsigned_compare,
+                run_test_duplicates_and_zeros,
+                run_test_response_meta,
+                run_test_response_held,
+                run_test_reset_mid_request,
+            ]:
+        TestFactory(test).generate_tests()
+
+    # 1, 2 and 63 lines -- 4 KB with the header
+    factory = TestFactory(run_test_timing)
+    factory.add_option("lines", [1, 2, 63])
+    factory.generate_tests()
+
+    # the slot boundary carries no sideband
+    if LEVEL == "core":
+        TestFactory(run_test_sideband).generate_tests()
+
+    factory = TestFactory(run_stress_test)
+    factory.add_option("idle_inserter", [None, cycle_pause])
+    factory.add_option("backpressure_inserter", [None, cycle_pause])
+    factory.generate_tests()
+
+
+# --------------------------------------------------------------- cocotb-test
+#
+# Imported down here so that `make` needs neither pytest nor cocotb-test.
+
+import cocotb_test.simulator  # noqa: E402
+import pytest  # noqa: E402
+
+tests_dir = os.path.dirname(__file__)
+rtl_dir = os.path.abspath(os.path.join(tests_dir, '..', 'src', 'rtl'))
+
+
+@pytest.mark.parametrize("level,top_k_num", [
+    ("core", 1), ("core", 4), ("core", 8), ("core", 16), ("slot", 16),
+])
+def test_top_k(request, level, top_k_num):
+    dut = "top_k"
+    module = os.path.splitext(os.path.basename(__file__))[0]
+    reasm_dir = os.path.join(tests_dir, "..", "..", "..", "reassembly")
+
+    verilog_sources = [os.path.join(rtl_dir, f"{dut}_core.v")]
+    extra_args = ["--sv", "-DSIMULATION", "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC"]
+
+    if level == "slot":
+        toplevel = "tb_slot"
+        verilog_sources += [
+            os.path.join(rtl_dir, f"{dut}.v"),
+            os.path.join(reasm_dir, "rtl", "slot_credit.v"),
+            os.path.join(reasm_dir, "rtl", "slot_boundary.v"),
+            os.path.join(reasm_dir, "tb", "tb_slot.sv"),
+        ]
+        extra_args.append(f"-DSLOT_RM={dut}")
+        parameters = {}
+    else:
+        toplevel = f"{dut}_core"
+        parameters = {'TOP_K_NUM': top_k_num}
+
+    extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
+    extra_env['LEVEL'] = level
+
+    sim_build = os.path.join(tests_dir, "sim_build",
+        request.node.name.replace('[', '-').replace(']', ''))
+
+    cocotb_test.simulator.run(
+        simulator="verilator",
+        python_search=[tests_dir],
+        verilog_sources=verilog_sources,
+        toplevel=toplevel,
+        module=module,
+        parameters=parameters,
+        sim_build=sim_build,
+        extra_env=extra_env,
+        extra_args=extra_args,
+    )

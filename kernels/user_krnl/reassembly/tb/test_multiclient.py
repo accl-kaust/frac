@@ -1,0 +1,357 @@
+#!/usr/bin/env python
+"""
+Several TCP clients at once, as the board sees them under load.
+
+The TOE queues every connection's segments in one RX FIFO (ToeRxBuffer), so
+segments of different clients reach the dispatcher interleaved and back to
+back.  Each client keeps a number of requests in flight, and every response
+must come back whole, exactly once, on its own connection, announced with its
+own length.
+"""
+
+import random
+from collections import Counter, defaultdict, deque
+
+import cocotb
+from cocotb.triggers import ClockCycles, RisingEdge
+from cocotbext.axi import AxiStreamFrame
+
+from test_reassembly import (
+    BYTE_LANES, REQ_FLAG_FIRST, REQ_FLAG_SINGLE, TB, TOE_MSS, RequestHeader, ToeRxBuffer,
+    frame_to_int, int_to_le_bytes,
+)
+
+
+def make_request(total_bytes, conn_id, seq):
+    """
+    An echo request whose data lines carry (connection, request, line), so a
+    beat that lands in the wrong response, twice, or not at all shows.  Byte
+    60 bit 0 -- the FIRST flag -- stays clear in data lines.
+    """
+    flags = REQ_FLAG_SINGLE if total_bytes == BYTE_LANES else REQ_FLAG_FIRST
+    header = RequestHeader(total_size=total_bytes, workload_id=0x0000, request_flags=flags).to_bytes()
+    lines = []
+    for idx in range(total_bytes // BYTE_LANES - 1):
+        tag = (conn_id & 0xffff) | ((seq & 0xffff) << 16) | ((idx + 1) << 32)
+        line = bytearray(int_to_le_bytes(tag, 8) * 8)
+        line[60] &= 0xfe
+        lines.append(bytes(line))
+    return header + b"".join(lines)
+
+
+def cut(request, framing, mss=TOE_MSS):
+    """
+    The segments the host sends for one request: written in one piece and cut
+    at the MSS ("one_write"), or sw/app's header segment followed by the data
+    written in one piece ("header_alone").
+    """
+    if framing == "one_write":
+        return [request[o:o + mss] for o in range(0, len(request), mss)]
+    data = request[BYTE_LANES:]
+    return [request[:BYTE_LANES]] + [data[o:o + mss] for o in range(0, len(data), mss)]
+
+
+class ToeTx:
+    """The TOE's TX side accepting every request: a response is its metadata and its data."""
+
+    def __init__(self, tb, status_delay=8):
+        self.tb = tb
+        self.status_delay = status_delay
+        self.metas = deque()
+        self.responses = []     # (metadata, data)
+        cocotb.start_soon(self._status())
+        cocotb.start_soon(self._data())
+
+    async def _status(self):
+        while True:
+            self.metas.append(frame_to_int(await self.tb.tx_metadata_sink.recv()))
+            await ClockCycles(self.tb.dut.clk, self.status_delay)
+            await self.tb.tx_status_source.send(AxiStreamFrame(int_to_le_bytes(0, 8)))
+
+    async def _data(self):
+        while True:
+            data = bytes((await self.tb.tx_data_sink.recv()).tdata)
+            self.responses.append((self.metas.popleft() if self.metas else None, data))
+
+
+class ToeTxWindows:
+    """
+    The TOE's TX side deciding admission per session, as tasi_metaLoader does:
+    a request longer than the session's usable window is refused with error 2
+    and that window in [61:32], every request for a closed session with error
+    1, and only an accepted request's data is read.  Accepted data is appended
+    to its session's byte stream; data with no accepted request to go with it
+    is a protocol error.
+    """
+
+    def __init__(self, tb, window_of, closed=(), status_delay=8):
+        self.tb = tb
+        self.window_of = window_of      # (session, attempt) -> usable window in bytes
+        self.closed = set(closed)
+        self.status_delay = status_delay    # cycles, or a callable giving them per request
+        self.attempts = defaultdict(int)
+        self.refused = defaultdict(int)
+        self.accepted = deque()         # (session, length) whose data is due
+        self.streams = defaultdict(bytearray)
+        self.errors = []
+        cocotb.start_soon(self._status())
+        cocotb.start_soon(self._data())
+
+    async def _status(self):
+        while True:
+            meta = frame_to_int(await self.tb.tx_metadata_sink.recv())
+            session, length = meta & 0xffff, meta >> 16
+            self.attempts[session] += 1
+            delay = self.status_delay() if callable(self.status_delay) else self.status_delay
+            if delay:
+                await ClockCycles(self.tb.dut.clk, delay)
+            if session in self.closed:
+                error, window = 1, 0
+            else:
+                window = self.window_of(session, self.attempts[session])
+                error = 0 if length <= window else 2
+            if error:
+                self.refused[session] += 1
+            else:
+                self.accepted.append((session, length))
+            status = (error << 62) | ((window & 0x3fffffff) << 32) | (length << 16) | session
+            await self.tb.tx_status_source.send(AxiStreamFrame(int_to_le_bytes(status, 8)))
+
+    async def _data(self):
+        while True:
+            data = bytes((await self.tb.tx_data_sink.recv()).tdata)
+            if not self.accepted:
+                self.errors.append(f"{len(data)} bytes sent with no accepted request")
+                continue
+            session, length = self.accepted.popleft()
+            if len(data) != length:
+                self.errors.append(f"session {session:#x}: {len(data)} bytes sent for a {length}-byte request")
+            self.streams[session] += data
+
+
+async def run_clients(dut, n_clients, sizes, framing, requests_per_client, window=1, seed=1, patience=20000):
+    """
+    n_clients connections sending requests of the given sizes, each keeping up
+    to `window` of them in flight; their segments reach the TOE round robin.
+    Returns how many responses were wrong, missing, or announced with a length
+    other than their own.  Gives up after `patience` cycles without progress.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    toe = ToeRxBuffer(tb)
+    tx = ToeTx(tb)
+    rng = random.Random(seed)
+
+    conns = [0x100 + c for c in range(n_clients)]
+    expected = {c: [make_request(rng.choice(sizes), c, s) for s in range(requests_per_client)] for c in conns}
+    unsent = {c: deque(expected[c]) for c in conns}
+    segments = {c: deque() for c in conns}
+    in_flight = defaultdict(int)
+    total = n_clients * requests_per_client
+    credited = 0
+    idle = 0
+    while idle < patience and (credited < total or any(unsent[c] or segments[c] for c in conns)):
+        progressed = False
+        for c in conns:
+            if not segments[c] and unsent[c] and in_flight[c] < window:
+                segments[c].extend(cut(unsent[c].popleft(), framing))
+                in_flight[c] += 1
+            if segments[c]:
+                await toe.receive_segment(segments[c].popleft(), conn_id=c)
+                progressed = True
+        for meta, _ in tx.responses[credited:]:
+            if meta is not None:
+                in_flight[meta & 0xffff] = max(0, in_flight[meta & 0xffff] - 1)
+            progressed = True
+        credited = len(tx.responses)
+        if progressed:
+            idle = 0
+        else:
+            await ClockCycles(dut.clk, 16)
+            idle += 16
+    await ClockCycles(dut.clk, 500)
+
+    got = defaultdict(list)
+    length_mismatch = 0
+    for meta, data in tx.responses:
+        if meta is None or (meta >> 16) != len(data):
+            length_mismatch += 1
+        if meta is not None:
+            got[meta & 0xffff].append(data)
+    wrong = sum(g != e for c in conns for g, e in zip(got[c], expected[c]))
+    wrong += sum(max(0, len(got[c]) - len(expected[c])) for c in conns)
+    missing = sum(max(0, len(expected[c]) - len(got[c])) for c in conns)
+    dut._log.info(f"{n_clients} clients, {framing}, sizes {sizes}: {total} requests, "
+                  f"{len(tx.responses)} responses, {wrong} wrong, {missing} missing, "
+                  f"{length_mismatch} announced with another length")
+    return wrong, missing, length_mismatch
+
+
+def check(result):
+    assert result == (0, 0, 0), "wrong={} missing={} length mismatch={}".format(*result)
+
+
+async def run_refusing_stack(dut, n_clients, sizes, window_of, closed=(), requests_per_client=6, seed=3,
+                             status_delay=8, meta_pause=None):
+    """
+    One-segment requests from n_clients connections, all sent up front, against
+    a TX side that refuses requests as ToeTxWindows describes.  Every open
+    connection's byte stream must come out exactly as its requests went in.
+    status_delay and meta_pause (a pause generator for the tx metadata the
+    stack takes) move the stack's answers around the responses' data.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    toe = ToeRxBuffer(tb)
+    tx = ToeTxWindows(tb, window_of, closed, status_delay)
+    if meta_pause is not None:
+        tb.tx_metadata_sink.set_pause_generator(meta_pause)
+    rng = random.Random(seed)
+
+    conns = [0x200 + c for c in range(n_clients)]
+    expected = defaultdict(bytearray)
+    for s in range(requests_per_client):
+        for c in conns:
+            request = make_request(rng.choice(sizes), c, s)
+            await toe.receive_segment(request, conn_id=c)
+            if c not in tx.closed:
+                expected[c] += request
+    total = sum(len(stream) for stream in expected.values())
+    for _ in range(20000):
+        if sum(len(tx.streams[c]) for c in conns) >= total:
+            break
+        await ClockCycles(dut.clk, 16)
+    await ClockCycles(dut.clk, 2000)
+
+    dut._log.info(f"{n_clients} clients, sizes {sizes}: refused {dict(tx.refused)}, "
+                  f"got {[len(tx.streams[c]) for c in conns]} of {[len(expected[c]) for c in conns]} bytes")
+    assert not tx.errors, tx.errors[:4]
+    for c in conns:
+        assert bytes(tx.streams[c]) == bytes(expected[c]), f"connection {c:#x}"
+
+
+@cocotb.test()
+async def test_one_client_one_segment_requests(dut):
+    """One client, requests of 128 to 4096 bytes, each written in one piece."""
+    check(await run_clients(dut, 1, [128, 1024, 4096], "one_write", 12))
+
+
+@cocotb.test()
+async def test_four_clients_one_segment_requests(dut):
+    """Four clients whose one-segment requests of 128 to 4096 bytes interleave."""
+    check(await run_clients(dut, 4, [128, 1024, 4096], "one_write", 12))
+
+
+@cocotb.test()
+async def test_four_clients_single_and_multi_line_requests(dut):
+    """
+    One-line requests, which go straight to the single-packet FIFO, back to
+    back with eight-line ones from other clients.
+    """
+    check(await run_clients(dut, 4, [64, 64, 512], "one_write", 16))
+
+
+@cocotb.test()
+async def test_sixteen_clients_two_requests_in_flight(dut):
+    """Sixteen clients, two one-segment requests in flight each."""
+    check(await run_clients(dut, 16, [64, 512, 1024, 4096], "one_write", 10, window=2))
+
+
+@cocotb.test()
+async def test_two_clients_header_segment_then_data(dut):
+    """Two clients framing requests as sw/app does: a header segment, then the data."""
+    check(await run_clients(dut, 2, [1024, 4096], "header_alone", 8))
+
+
+@cocotb.test()
+async def test_four_clients_header_segment_then_data(dut):
+    """
+    Four clients framing requests as sw/app does.  A header segment that
+    arrives in the middle of another client's request starts a request of its
+    own, carrying its own size.
+    """
+    check(await run_clients(dut, 4, [1024, 4096], "header_alone", 8))
+
+
+@cocotb.test()
+async def test_small_send_window_splits_responses(dut):
+    """
+    Every session's usable window is 1000 bytes, so 4 KB responses are
+    refused whole and must go out as several requests that fit.
+    """
+    await run_refusing_stack(dut, 3, [256, 4096], lambda session, attempt: 1000)
+
+
+@cocotb.test()
+async def test_no_send_window_at_first(dut):
+    """The first requests find no room at all; later ones find plenty."""
+    await run_refusing_stack(dut, 3, [512, 2048], lambda session, attempt: 0 if attempt <= 3 else 1 << 20)
+
+
+@cocotb.test()
+async def test_closed_connection_responses_are_dropped(dut):
+    """One client has gone: its responses are dropped, everyone else's arrive intact."""
+    await run_refusing_stack(dut, 3, [256, 1024], lambda session, attempt: 1 << 20, closed={0x201})
+
+
+async def count_hand_overs(dut, counts):
+    """
+    How pkt_sender went on from each response whose successor's request it had
+    issued ahead: sending straight on, re-offering a request the stack had not
+    taken yet, or waiting in S_WAIT for the answer.
+    """
+    sender = dut.pkt_sender_inst
+    while True:
+        await RisingEdge(dut.clk)
+        if int(sender.resp_done.value) and int(sender.nx_state.value) != 0:
+            if int(sender.nx_ok_now.value):
+                counts["sent_straight_on"] += 1
+            elif int(sender.nx_state.value) == 1 and not int(sender.nx_req_fire.value):
+                counts["still_on_offer"] += 1
+            else:
+                counts["answer_decides"] += 1
+
+
+@cocotb.test()
+async def test_stack_answers_race_the_last_beat(dut):
+    """
+    pkt_sender issues a response's request while the one before it is still
+    going out.  Stack answers delayed 0 to 40 cycles, a stack that stalls the
+    tx metadata a third of the time, windows that often refuse, and one closed
+    connection put that request's acceptance, refusal or silence at every point
+    of the response ahead of it -- its last beat included.  Every stream must
+    still come out whole and in order, and all three ways of going on from a
+    response must have happened.
+    """
+    rng = random.Random(7)
+    counts = Counter()
+    cocotb.start_soon(count_hand_overs(dut, counts))
+    windows = [1 << 20] * 5 + [1000, 300, 0]
+    await run_refusing_stack(
+        dut, 4, [128, 256, 1024, 2048, 4096],
+        lambda session, attempt: rng.choice(windows),
+        closed={0x203}, requests_per_client=12, seed=8,
+        status_delay=lambda: rng.randrange(41),
+        meta_pause=iter(lambda: rng.random() < 0.33, None))
+    dut._log.info(f"hand-overs: {dict(counts)}")
+    for way in ("sent_straight_on", "still_on_offer", "answer_decides"):
+        assert counts[way], f"never {way.replace('_', ' ')}: {dict(counts)}"
+
+
+@cocotb.test(expect_fail=True)
+async def test_more_multi_segment_requests_than_queues_stall(dut):
+    """
+    KNOWN LIMIT.  A request spread over several segments holds a scheduler
+    queue until its last segment is in.  Eight clients each opening a 16 or
+    24 KB request at MSS 8192 need eight queues at once; the fifth request
+    waits for one, and since the TOE hands every connection's segments over
+    in order, the segments that would finish the first four are behind it.
+    Nothing more comes out.
+
+    The sizes track the MSS.  At MSS 4096 this read [8192, 16384]; raising the
+    MSS to 8192 makes an 8 KB request a single segment, which never holds a
+    queue across segments, so the limit stops reproducing at that size.  That
+    is a real if narrow win from the larger MSS, not a fix for the limit --
+    scaled up, it still deadlocks.
+    """
+    check(await run_clients(dut, 8, [16384, 24576], "one_write", 4))

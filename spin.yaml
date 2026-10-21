@@ -1,0 +1,185 @@
+units:
+- name: pattern_slot
+  path: kernels/user_krnl/apps/pattern_slot
+  moduletype: recon
+  top: pattern_slot
+  build: synth
+  build_dir: build
+  rtl:
+    dir: src/rtl
+    files:
+    - pattern_slot.v
+    - pattern_slot_core.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files: null
+  ip:
+    dir: src/ip
+    files: null
+  # out-of-context synthesis, Vivado 2022.2: 673 LUT, 1690 FF, 0 BRAM, 0 DSP
+  utilization:
+    slices: 106
+    ramb36: 0
+    dsp: 0
+- name: or_slot
+  path: kernels/user_krnl/apps/or_slot
+  moduletype: recon
+  top: or_slot
+  build: synth
+  build_dir: build
+  rtl:
+    dir: src/rtl
+    files:
+    - or_slot.v
+    - or_slot_core.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files: null
+  ip:
+    dir: src/ip
+    files: null
+  # out-of-context synthesis, Vivado 2022.2: 64 LUT, 132 FF, 0 BRAM, 0 DSP
+  utilization:
+    slices: 9
+    ramb36: 0
+    dsp: 0
+- name: top_k
+  path: kernels/user_krnl/apps/top_k
+  moduletype: recon
+  top: top_k
+  build: synth
+  build_dir: build
+  rtl:
+    dir: src/rtl
+    files:
+    - top_k.v
+    - top_k_core.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files: null
+  ip:
+    dir: src/ip
+    files: null
+  # out-of-context synthesis, Vivado 2022.2: 9116 LUT, 7339 FF, 0 BRAM, 0 DSP
+  utilization:
+    slices: 1140
+    ramb36: 0
+    dsp: 0
+- name: log
+  path: kernels/user_krnl/apps/log
+  moduletype: recon
+  top: log
+  build: synth
+  build_dir: build
+  rtl:
+    dir: src/rtl
+    files:
+    - log.v
+    - log_core.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+    # the output FIFO the core queues its responses in
+    - ../../../../reassembly/rtl/axis_fifo_taxi.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_if.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_fifo.sv
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files: null
+  ip:
+    dir: src/ip
+    files: 
+    - gen_ip.tcl
+  # out-of-context synthesis, Vivado 2022.2: 3245 LUT, 7554 FF, 0 BRAM, 6 DSP
+  utilization:
+    slices: 473
+    ramb36: 0
+    dsp: 6
+- name: norm
+  path: kernels/user_krnl/apps/norm
+  moduletype: recon
+  top: norm
+  build: synth
+  build_dir: build
+  rtl:
+    dir: src/rtl
+    files:
+    - norm.v
+    - norm_core.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+    # the output FIFO the core queues its responses in
+    - ../../../../reassembly/rtl/axis_fifo_taxi.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_if.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_fifo.sv
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files: null
+  ip:
+    dir: src/ip
+    files: 
+    - gen_ip.tcl
+  # out-of-context synthesis, Vivado 2022.2: 4113 LUT, 6270 FF, 7.5 BRAM, 2 DSP
+  utilization:
+    slices: 515
+    ramb36: 8
+    dsp: 2
+- name: cnn
+  path: kernels/user_krnl/apps/cnn
+  moduletype: recon
+  top: cnn
+  build: synth
+  build_dir: build
+  # the CNN is a packaged Vitis HLS IP: its .xci below, found in this repository
+  ip_repo_paths:
+  - src/ip
+  rtl:
+    dir: src/rtl
+    files:
+    - cnn.v
+    - cnn_core.v
+    - CNN_workload.v
+    - packet_parser_CNN.v
+    - nukv_fifogen.v
+    # the boundary's credit ends; the static side uses the same file
+    - ../../../../reassembly/rtl/slot_credit.v
+    # the core's input and parser FIFOs
+    - ../../../../reassembly/rtl/axis_fifo_taxi.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_if.sv
+    - ../../../../../../lib/taxi/axis/rtl/taxi_axis_fifo.sv
+  xdc:
+    dir: src/xdc
+    files: null
+  xci:
+    dir: src/xci
+    files:
+    - myproject_1.xci
+  ip:
+    dir: src/ip
+    files: null
+  # out-of-context synthesis, Vivado 2022.2: 42127 LUT, 60546 FF, 79.5 BRAM,
+  # 219 DSP and 140 URAM, which these fields do not count; a cell has 64 URAM
+  utilization:
+    slices: 5266
+    ramb36: 80
+    dsp: 219
