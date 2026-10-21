@@ -33,7 +33,6 @@ typedef enum {
 	ROUTE_CUSTOM = 0x1,
 } axiRoute;
 
-
 struct dmCmd
 {
 	ap_uint<23>	bbt;
@@ -84,18 +83,18 @@ struct memCmd
 {
 	ap_uint<64> addr;
 	ap_uint<32> len;
-	ap_uint<4>  local_reg;
-	ap_uint<1>  ctl;
-	ap_uint<1>  host; 
 	memCmd() {}
-	memCmd(ap_uint<64> addr, ap_uint<32> len, ap_uint<4> local_reg, ap_uint<1> ctl, ap_uint<1> host)
-		:addr(addr), len(len), local_reg(local_reg), ctl(ctl), host(host) {}
+	memCmd(ap_uint<64> addr, ap_uint<32> len)
+		:addr(addr), len(len) {}
 };
 
 struct routedMemCmd
 {
 	memCmd      data;
+	ap_uint<1>	dest;
 	routedMemCmd() {}
-	routedMemCmd(ap_uint<64> addr, ap_uint<32> len, ap_uint<4> local_reg, ap_uint<1> ctl, ap_uint<1> host)
-		:data(addr, len, local_reg, ctl, host) {}
+	routedMemCmd(ap_uint<64> addr, ap_uint<32> len)
+		:data(addr, len), dest(ROUTE_DMA) {}
+	routedMemCmd(ap_uint<64> addr, ap_uint<32> len, axiRoute route)
+		:data(addr, len), dest(route) {}
 };

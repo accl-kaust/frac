@@ -32,14 +32,16 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 bool checkIfResponse(ibOpCode code)
 {
 	return (code == RC_RDMA_READ_RESP_FIRST || code == RC_RDMA_READ_RESP_MIDDLE ||
-			code == RC_RDMA_READ_RESP_LAST  || code == RC_RDMA_READ_RESP_ONLY ||
+			code == RC_RDMA_READ_RESP_LAST || code == RC_RDMA_READ_RESP_ONLY ||
 			code == RC_ACK);
 }
 
-bool checkIfWrite(ibOpCode code)
+bool checkIfWriteOrPartReq(ibOpCode code)
 {
 	return (code == RC_RDMA_WRITE_FIRST || code == RC_RDMA_WRITE_MIDDLE ||
-			code == RC_RDMA_WRITE_LAST  || code == RC_RDMA_WRITE_ONLY);
+			code == RC_RDMA_WRITE_LAST || code == RC_RDMA_WRITE_ONLY ||
+			code == RC_RDMA_PART_FIRST || code == RC_RDMA_PART_MIDDLE ||
+			code == RC_RDMA_PART_LAST || code == RC_RDMA_PART_ONLY);
 }
 
 bool checkIfAethHeader(ibOpCode code)
@@ -50,6 +52,7 @@ bool checkIfAethHeader(ibOpCode code)
 
 bool checkIfRethHeader(ibOpCode code)
 {
-	return (code == RC_RDMA_WRITE_ONLY  || code == RC_RDMA_WRITE_FIRST ||
-			code == RC_RDMA_READ_REQUEST);
+	return (code == RC_RDMA_WRITE_ONLY || code == RC_RDMA_WRITE_FIRST ||
+			code == RC_RDMA_PART_ONLY || code == RC_RDMA_PART_FIRST ||
+			code == RC_RDMA_READ_REQUEST || code == RC_RDMA_READ_CONSISTENT_REQUEST);
 }
