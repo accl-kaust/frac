@@ -1,8 +1,8 @@
 # fRAC: Remote Accelerator Calls on Hostless FPGAs
 
-fRAC enables the hostless, in-network deployment of accelerators on FPGAs. fRAC builds on a networking stack, adding application-level request reassembly before dispatching them to accelerators. Request reassembly, dispatch, and accelerator invocation are handled entirely on the FPGA, eliminating host software from the invocation path. Accelerators are assumed to follow a run-to-completion execution model, processing each request to completion before serving the next. The design is transport-layer agnostic but assumes reliable, in-order delivery of network packets. The current implementation uses EasyNet, a TCP/IP stack for FPGAs.
+fRAC lets clients invoke accelerators on an FPGA directly over the network, with no host CPU or software in the invocation path. Built on top of a network stack, it reassembles application-level requests from the incoming byte stream, dispatches them to virtualized accelerator slots, and returns the results, all in hardware. Accelerators follow a run-to-completion model, finishing each request before taking the next. The design is transport-agnostic, but it requires reliable, in-order delivery; the current implementation uses EasyNet, a TCP/IP stack for FPGAs.
 
-fRAC supports 100G networking and has been tested on an Alveo U280 with minimal overhead. It also includes a reconfiguration controller for managing partial reconfiguration (PR) over the network. Bitstreams can be transferred over the network and stored in HBM, then streamed to the ICAP to reconfigure PR regions.
+fRAC supports 100 Gbps and has been evaluated on an AMD Alveo U280, where it adds minimal overhead. Accelerator slots can be swapped at runtime: a built-in reconfiguration controller accepts partial bitstreams over the network, stores them in HBM, and streams them reconfigure individual accelerator slots.
 
 ## Prerequisites
 
