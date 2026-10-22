@@ -4,6 +4,10 @@ fRAC lets clients invoke accelerators on an FPGA directly over the network, with
 
 fRAC supports 100 Gbps and has been evaluated on an AMD Alveo U280, where it adds minimal overhead. Accelerator slots can be swapped at runtime: a built-in reconfiguration controller accepts partial bitstreams over the network, stores them in HBM, and streams them reconfigure individual accelerator slots.
 
+<p align="center">
+  <img src="Figure/Architecture_with_PR.png" alt="fRAC architecture with partial reconfiguration" width="80%">
+</p>
+
 ## Prerequisites
 
 Vitis HLS and Vivado are required to build the design. fRAC has been tested with version 2022.2 of these tools. Newer versions are expected to work but have not been tested.
