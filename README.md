@@ -5,7 +5,7 @@ fRAC lets clients invoke accelerators on an FPGA directly over the network, with
 fRAC supports 100 Gbps and has been evaluated on an AMD Alveo U280, where it adds minimal overhead. Accelerator slots can be swapped at runtime: a built-in reconfiguration controller accepts partial bitstreams over the network, stores them in HBM, and streams them reconfigure individual accelerator slots.
 
 <p align="center">
-  <img src="Figure/Architecture_with_PR.png" alt="fRAC architecture with partial reconfiguration" width="80%">
+  <img src="docs/figures/frac-architecture.svg" alt="fRAC architecture" width="80%">
 </p>
 
 ## Prerequisites
